@@ -6,4 +6,4 @@ The flp_data_connector class that lives in the "Helpers" subfolder contains the 
 -BURAPP007
 -DataQuant01
 
-The "Notebooks" subfolder contains Jupyter notebooks that can serve as examples or utilities to use that class to upload to query data.\
+The "Notebooks" subfolder contains Jupyter notebooks that can serve as examples or utilities to use that class to upload to query data.
