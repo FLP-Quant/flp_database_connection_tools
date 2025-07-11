@@ -1,7 +1,8 @@
 import pandas as pd
 import pyodbc
 from typing import List, Tuple
-# import getpass
+import datetime
+import warnings
 
 class flp_database_connector:
     def __init__(self, username: str) -> None:
@@ -9,6 +10,33 @@ class flp_database_connector:
         self.quant_server_name = "azrsql002.database.windows.net"
         self.burapp_server_name = "BURAPP007"
         self.username = username
+        self.schema_standards = {
+                                    "pricing": {
+                                        "required_columns": [
+                                            "datetime_he", "pricing_location", "wholesale_market", "market_type",
+                                            "service", "price", "unit", "currency", "interval_width_s",
+                                            "update_timestamp", "update_user"
+                                        ],
+                                        "primary_key": ["datetime_he", "pricing_location", "wholesale_market", "market_type", "service"]
+                                    },
+                                    "ops": {
+                                        "required_columns": [
+                                            "datetime_he", "asset", "name", "ops_type", "service",
+                                            "da_volume", "rt_volume", "unit", "interval_width_s",
+                                            "update_timestamp", "update_user"
+                                        ],
+                                        "primary_key": ["datetime_he", "asset", "name", "ops_type", "service"]
+                                    },
+                                    "revenue": {
+                                        "required_columns": [
+                                            "datetime_he", "asset", "name", "ops_type", "service",
+                                            "da_revenue", "rt_revenue", "total_revenue", "currency",
+                                            "interval_width_s", "update_timestamp", "update_user"
+                                        ],
+                                        "primary_key": ["datetime_he", "asset", "name", "ops_type", "service"]
+                                    }
+                                }
+
 
     # --- Functions to connect to databses ---
     def connect_to_quant_db(self) -> pyodbc.Connection:
@@ -61,7 +89,8 @@ class flp_database_connector:
         table_name: str,
         excel_file: str,
         mode: str = "append",
-        skip_prompt: bool = False
+        skip_prompt: bool = False,
+        check_standards: bool = True
     ) -> None:
         """
         Upload Excel data to the Quant SQL server.
@@ -69,22 +98,24 @@ class flp_database_connector:
         If the table doesn't exist, will create it.
 
         Parameters:
-            table_name: str           -- e.g., "dbo.MyTable"
-            excel_file: str           -- path to Excel file
-            mode: str = "append"      -- 'append' or 'overwrite'
-            skip_prompt: bool = False -- if true, skip user prompt asking for confirmation of overwriting or creating a new table
+            table_name: str              -- e.g., "dbo.MyTable"
+            excel_file: str              -- path to Excel file
+            mode: str = "append"         -- 'append' or 'overwrite'
+            skip_prompt: bool = False    -- if true, skip user prompt asking for confirmation of overwriting or creating a new table
+            check_standards: bool = True -- if true, check that column names match expectation for schema & create primary key if creating new table
         """
         # Step 1: Load Excel
         df = pd.read_excel(excel_file)
 
         # Step 2: Upload data
-        self.upload_data_to_quant_db(table_name, df, mode, skip_prompt)
+        self.upload_data_to_quant_db(table_name, df, mode, skip_prompt, check_standards)
 
     def upload_data_to_quant_db(self,
         table_name: str,
         df: pd.DataFrame,
         mode: str = "append",
-        skip_prompt: bool = False
+        skip_prompt: bool = False,
+        check_standards: bool = True
     ) -> None:
         """
         Upload data from a dataframe to the Quant SQL server.
@@ -92,32 +123,57 @@ class flp_database_connector:
         If the table doesn't exist, will create it.
 
         Parameters:
-            table_name: str           -- e.g., "dbo.MyTable"
-            df: dataframe             -- Pandas dataframe containing the data to be uploaded
-            mode: str = "append"      -- 'append', 'overwrite', or 'create
-            skip_prompt: bool = False -- if true, skip user prompt asking for confirmation of creating or overwriting a table
+            table_name: str              -- e.g., "dbo.MyTable"
+            df: dataframe                -- Pandas dataframe containing the data to be uploaded
+            mode: str = "append"         -- 'append', 'overwrite', or 'create
+            skip_prompt: bool = False    -- if true, skip user prompt asking for confirmation of creating or overwriting a table
+            check_standards: bool = True -- if true, check that column names match expectation for schema & create primary key if creating new table
         """
-        # Step 1: Connect to SQL
+        # Step 1: If data doesn't already have update_timestamp and update_user columns, add them
+        if 'update_timestamp' not in df.columns:
+            df['update_timestamp'] = datetime.datetime.now()
+        if 'update_user' not in df.columns:
+            username = self.username.split('\\')[-1]  # Remove domain if present
+            df['update_user'] = username
+
+        # Step 2: Validate schema & column standards
+        schema, _ = table_name.split(".")
+        if check_standards:
+            if schema in ["pricing", "ops", "revenue"]:
+                required = self.schema_standards[schema]["required_columns"]
+                missing = [col for col in required if col not in df.columns]
+                if missing:
+                    raise ValueError(f"Missing required columns for schema '{schema}': {missing}")
+                primary_key_columns = self.schema_standards[schema]["primary_key"]
+            elif schema == "dbo":
+                warnings.warn("Table is being uploaded to 'dbo' schema. Most uploads are expected in 'pricing', 'ops', or 'revenue'. Proceeding without column validation.\n See documentation here for details: https://firstlightpower.atlassian.net/wiki/spaces/QS/pages/2003697666/Quant+Database#%F0%9F%93%9A-Database-Standards,-Schemas,-and-Naming-Conventions")
+                primary_key_columns = None
+            else:
+                raise ValueError(f"Unknown schema '{schema}'. Expected one of 'pricing', 'ops', 'revenue', or 'dbo'.")
+        else:
+             primary_key_columns = None
+        
+        # Step 3: Connect to SQL
         conn = self.connect_to_quant_db()
         cursor = conn.cursor()
 
-        # Step 2: Get schema & validate column names if table exists. If it doesn't, create a new table
+        # Step 4: Get schema & validate column names if table exists. If it doesn't, create a new table
         sql_columns = self.get_sql_columns(cursor, table_name)
         if len(sql_columns) < 1:
             if mode=="create" or skip_prompt or input(f"Table '{table_name}' does not exist. Create it? (y/n): ").lower() == 'y':
-                    self.create_table_from_dataframe(cursor, table_name, df)
+                    self.create_table_from_dataframe(cursor, table_name, df, primary_key_columns=primary_key_columns)
             else:
                 raise ValueError("Table does not exist and creation was cancelled by user.")
         else:
             self.validate_columns(df.columns.tolist(), sql_columns)
 
-        # Step 3: Clear table if mode is overwrite
+        # Step 5: Clear table if mode is overwrite
         if mode.lower() == "overwrite" and (skip_prompt or input(f"Confirm overwriting all rows in '{table_name}'? (y/n): ").lower() == 'y'):
             cursor.execute(f"DELETE FROM {table_name}")
             print(f"All previous data in {table_name} cleared...")
             conn.commit()
 
-        # Step 4: Insert rows into SQL table
+        # Step 6: Insert rows into SQL table
         placeholders = ", ".join(["?"] * len(df.columns))
         colnames = ", ".join(df.columns)
         sql = f"INSERT INTO {table_name} ({colnames}) VALUES ({placeholders})"
@@ -177,7 +233,7 @@ class flp_database_connector:
                 [f"  Position {i+1}: Excel = '{excel_columns[i]}' vs SQL = '{sql_colnames[i]}'" for i in mismatched])
             raise ValueError(f"Column name mismatch:\n{details}")
         
-    def create_table_from_dataframe(self, cursor: pyodbc.Cursor, table_name: str, df: pd.DataFrame) -> None:
+    def create_table_from_dataframe(self, cursor: pyodbc.Cursor, table_name: str, df: pd.DataFrame, primary_key_columns: List[str] = None) -> None:
         dtype_mapping = {
             "object": "NVARCHAR(100)",
             "int64": "BIGINT",
@@ -185,13 +241,24 @@ class flp_database_connector:
             "datetime64[ns]": "DATETIME",
             "bool": "BIT"
         }
+
+        # Define column names & data types
         columns_sql = []
         for col in df.columns:
             dtype = str(df[col].dtype)
             sql_type = dtype_mapping.get(dtype, "NVARCHAR(100)")
             columns_sql.append(f"[{col}] {sql_type}")
 
-        schema, table = table_name.split(".")
-        create_stmt = f"CREATE TABLE {table_name} (" + ", ".join(columns_sql) + ")"
+        # If input is used, create primary keys for checking uniqueness and faster indexing
+        if primary_key_columns:
+            for col in primary_key_columns:
+                if col not in df.columns:
+                    raise ValueError(f"Primary key column '{col}' not found in DataFrame.")
+            pk_clause = f", PRIMARY KEY ({', '.join([f'[{col}]' for col in primary_key_columns])})"
+        else:
+            pk_clause = ""
+
+        # Create table
+        create_stmt = f"CREATE TABLE {table_name} ({', '.join(columns_sql)}{pk_clause})"
         cursor.execute(create_stmt)
         print(f"Created new table: {table_name}")
